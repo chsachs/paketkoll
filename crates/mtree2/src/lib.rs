@@ -45,6 +45,7 @@ pub use parser::FileMode;
 pub use parser::FileType;
 pub use parser::Format;
 use parser::Keyword;
+use parser::LineParseError;
 use parser::MTreeLine;
 pub use parser::ParserError;
 use parser::SpecialKind;
@@ -114,7 +115,7 @@ where
     }
 
     /// This is a helper function to make error handling easier.
-    fn next_entry(&mut self, line: io::Result<Vec<u8>>) -> Result<Option<Entry>, Error> {
+    fn next_entry(&mut self, line: io::Result<Vec<u8>>) -> Result<Option<Entry>, LineParseError> {
         let line = line?;
         let line = MTreeLine::from_bytes(&line)?;
         Ok(match line {
@@ -133,7 +134,9 @@ where
                     "relative without a current working dir"
                 );
                 let filepath = decode_escapes_path(self.cwd.join(OsStr::from_bytes(path)))
-                    .ok_or_else(|| Error::Parser(ParserError("Failed to decode escapes".into())))?;
+                    .ok_or_else(|| {
+                        LineParseError::ParserError(ParserError("Failed to decode escapes".into()))
+                    })?;
                 if params.file_type == Some(FileType::Directory) {
                     self.cwd.push(filepath.as_path());
                 }
@@ -153,7 +156,9 @@ where
                 Some(Entry {
                     path: decode_escapes_path(Path::new(OsStr::from_bytes(path)).to_owned())
                         .ok_or_else(|| {
-                            Error::Parser(ParserError("Failed to decode escapes".into()))
+                            LineParseError::ParserError(ParserError(
+                                "Failed to decode escapes".into(),
+                            ))
                         })?,
                     params,
                 })
@@ -169,11 +174,31 @@ where
     type Item = Result<Entry, Error>;
 
     fn next(&mut self) -> Option<Result<Entry, Error>> {
+        let mut acc: Option<Vec<u8>> = None;
         while let Some(line) = self.inner.next() {
-            match self.next_entry(line) {
+            let line = match line {
+                Ok(line) => line,
+                Err(e) => return Some(Err(Error::Io(e))),
+            };
+
+            let input = if let Some(mut acc) = acc.take() {
+                acc.extend_from_slice(&line);
+                Ok(acc)
+            } else {
+                Ok(line)
+            };
+
+            match self.next_entry(input) {
                 Ok(Some(entry)) => return Some(Ok(entry)),
                 Ok(None) => (),
-                Err(e) => return Some(Err(e)),
+                Err(e) => match e {
+                    LineParseError::WrappedLine(mut w) => {
+                        w.pop(); // remove backslash
+                        acc = Some(w);
+                        continue;
+                    }
+                    _ => return Some(Err(e.into())),
+                },
             }
         }
         None
@@ -465,6 +490,7 @@ impl Params {
             Keyword::Type(ty) => self.file_type = Some(ty),
             Keyword::Uid(uid) => self.uid = Some(uid),
             Keyword::Uname(uname) => self.uname = Some(uname.into()),
+            Keyword::Wrapped => (),
         }
     }
 
@@ -656,8 +682,15 @@ impl From<io::Error> for Error {
     }
 }
 
-impl From<ParserError> for Error {
-    fn from(from: ParserError) -> Self {
-        Self::Parser(from)
+impl From<LineParseError> for Error {
+    fn from(from: LineParseError) -> Self {
+        match from {
+            LineParseError::IoError(e) => Self::Io(e),
+            LineParseError::ParserError(e) => Self::Parser(e),
+            LineParseError::WrappedLine(e) => {
+                let s = String::from_utf8_lossy(e.as_slice()).to_string();
+                Self::Parser(ParserError::from("Wrapped Line: ".to_string() + s.as_str()))
+            }
+        }
     }
 }
